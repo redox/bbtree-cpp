@@ -405,6 +405,59 @@ own on a busier machine, `large_groups` at one thread took 23.8–24.8 ms
 against 19.6–21.6 for groups only and 29.8–32.4 for the pointer table,
 and 5M groups 125–160 against 113–130 and 191–206.
 
+### Building on new keys
+
+A join build under DuckDB inserted distinct keys about 6.7 ns a row
+slower than DuckDB's own pointer table, a figure taken as a build cell
+less a probe cell. `bench/hash_index_bench.cpp` times the index's part
+alone: random prehashed keys, 2048 rows a call, into an index reserved to
+its final size, so no row grows it; then hits on the same keys; then the
+same rows into a table of DuckDB's salt and pointer slots at the index's
+capacity, a row at a time, as DuckDB's build loop inserts. One run each,
+10M rows a cell, on an M4 Pro with other work running (`c861082`):
+
+| entries | insert new | find hit | pointer table insert | insert / pointer |
+|---:|---:|---:|---:|---:|
+| 65,536 (in L2) | 4.6 ns | 2.7 ns | 2.4 ns | 1.9 |
+| 2M | 8.0 ns | 7.6 ns | 6.4 ns | 1.25 |
+| 10M | 15.2 ns | 14.2 ns | 15.8 ns | 0.96 |
+
+The times out of cache moved by a sixth between passes on the busy
+machine (8.0 and 9.5 ns at 2M), the ratios by less than 0.05. Even
+distinct keys reach `compare` now and then, past another key of their
+fingerprint: 5 rows in a million at 2M.
+
+The model this replaced was that a new key costs what a hit costs and a
+second random line: the hit reads its tag and descriptor, the new key
+reads its tag and writes a descriptor no load brought in, where the
+pointer table reads and writes one slot. The cells refute it. Out of
+cache a new key costs what a hit does, and the pointer table, at one line
+a row, is not twice as fast: at 10M it is slower, since the steps keep
+2048 rows' loads in flight where a loop a row at a time keeps what the
+reorder window holds. The gap is CPU work: 2.2 ns a row in cache, 1.6
+at 2M.
+
+A profile of the in-cache cells (line tables, PCs mapped to lines with
+their inlining, 4,698 samples of insert, 2,891 of hits) splits them by
+step. The tags step costs the same in both, about 1.3 ns a row. The
+descriptors step costs a new key about 1.6 ns (its tag read again, the
+claim's descriptor, tag and list writes) against a hit's 1.0 for
+`confirm`. The commit pass costs about 1.0 ns, and a hit has nothing like
+it but its 0.2 in `compare`. That pass is ten instructions a claim,
+`size_` in a register, and validation before it is vectorized. It costs
+what it does because it goes back to the 2048 descriptors the claims
+wrote, 128 KB of lines, the whole L1, so each is in L2 again by then.
+
+So most of the measured 6.7 ns is outside the index: the index is 1.6 ns
+a row behind the pointer table at 2M, and half of that is the commit
+pass. A build whose rows exist before it indexes them, as a join's do,
+knows each row's handle before the call. A variant taking those handles
+could write each new key's final descriptor in the descriptors step,
+with no claim, no commit pass, no rollback, and one validation of the
+handles up front. That would remove the commit pass, about 1 ns a row.
+It is not done: the aggregate build creates its rows only for the keys
+it misses, and needs `create`.
+
 ## Verification
 
 `hash_map_test` checks mixed operations against `std::unordered_map`,
