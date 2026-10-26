@@ -175,6 +175,15 @@ class HashProbeIndex {
     ++size_;
   }
 
+  /// Fills an empty slot, writing its descriptor and tag once, without
+  /// reading either: a claim and its commit in one (D34).
+  void publish_empty(std::size_t slot, std::uint64_t hash, std::uint64_t identifier) noexcept {
+    SHOAL_ASSERT(identifier != 0 && identifier < identifier_mask() && this->identifier(slot) == 0);
+    descriptors_[slot] = (hash & ~identifier_mask()) | identifier;
+    tags()[slot] = wanted_tag(hash);
+    ++size_;
+  }
+
   // Pending external-row claims share the deleted encoding but never contribute
   // to tombstone accounting. They must be committed or released before return.
   void claim_empty(std::size_t slot, std::uint64_t hash) noexcept {

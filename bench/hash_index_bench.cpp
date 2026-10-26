@@ -3,7 +3,9 @@
 // Every row of the insert cell is a new key: one reaches `compare` only past
 // another key of its fingerprint, and no growth calls `stored_hash`. The hit
 // cell then finds the same keys, so that the two cells' difference is what a
-// new key costs beyond a probe. The keys are random words, used as their own
+// new key costs beyond a probe. The known cell inserts the same rows with
+// their handles given, as rows built before they are indexed have them
+// (`find_or_insert_many`, D34). The keys are random words, used as their own
 // hashes (design/05-hash-maps.md, "Building on new keys").
 //
 // The pointer cell inserts the same rows into a table after DuckDB's join
@@ -92,6 +94,28 @@ int main(int argc, char** argv) {
   if (index.size() != entries) std::abort();
   shoal_bench::report("u64 index_insert_new", entries, insert_ns / static_cast<double>(fills * entries));
   std::printf("  candidates a row %.6f\n", static_cast<double>(candidates) / static_cast<double>(fills * entries));
+  {
+    // The rows exist before the build, so their handles do (D34).
+    std::vector<std::uint64_t> handles(entries);
+    for (std::size_t row = 0; row < entries; ++row) handles[row] = row + 1;
+    double known_ns = 0;
+    for (std::size_t fill = 0; fill < fills; ++fill) {
+      index.clear_retain_capacity();
+      Stopwatch watch;
+      for (std::size_t base = 0; base < entries; base += per_call) {
+        const std::size_t width = entries - base < per_call ? entries - base : per_call;
+        index.find_or_insert_many(
+            scratch, width, [&](std::uint32_t row) { return hashes[base + row]; },
+            unreached_stored_hash, reject_all, handles.data() + base, results.data(),
+            positions.data());
+        shoal_bench::keep(results[0]);
+      }
+      known_ns += watch.ns_per(1);
+    }
+    if (index.size() != entries) std::abort();
+    shoal_bench::report("u64 index_insert_known", entries,
+                        known_ns / static_cast<double>(fills * entries));
+  }
   {
     Stopwatch watch;
     std::uint64_t sum = 0;

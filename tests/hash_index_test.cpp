@@ -583,6 +583,159 @@ TEST(probe_scratch_keeps_fingerprints_stops_and_one_position_array) {
 }
 
 namespace {
+// Rows that exist before they are indexed, as a join build's: input row r of
+// the build's n-th row overall has handle n + 1. Keys share four homes and
+// five fingerprints, so entries are displaced and probe past one another.
+struct PrebuiltRows {
+  std::vector<unsigned> keys;  // by handle - 1
+  static std::uint64_t hash_of_key(unsigned key) {
+    return (std::uint64_t{key % 5 + 1} << 48) | (key % 4);
+  }
+  auto stored_hash() const {
+    return [this](std::uint64_t handle) { return hash_of_key(keys[handle - 1]); };
+  }
+  auto hash_at(const std::vector<unsigned> &batch) const {
+    return [&batch](std::uint32_t row) { return hash_of_key(batch[row]); };
+  }
+  auto compare(const std::vector<unsigned> &batch) const {
+    return [this, &batch](std::uint32_t *candidates, std::size_t count, std::uint64_t *results,
+                          std::uint32_t *rejected) {
+      std::size_t n = 0;
+      for (std::size_t i = 0; i < count; ++i)
+        if (keys[results[candidates[i]] - 1] != batch[candidates[i]]) rejected[n++] = candidates[i];
+      return n;
+    };
+  }
+  // The batch's rows, materialized: their handles, in row order.
+  std::vector<std::uint64_t> append(const std::vector<unsigned> &batch) {
+    std::vector<std::uint64_t> handles;
+    for (auto key : batch) {
+      keys.push_back(key);
+      handles.push_back(keys.size());
+    }
+    return handles;
+  }
+};
+}  // namespace
+
+// The same builds through find_or_create_many, whose create returns each new
+// row's own handle, and find_or_insert_many: the same results, positions and
+// slots, through tiles, rounds of one batch's duplicates, and growth.
+TEST(find_or_insert_matches_find_or_create) {
+  PrebuiltRows rows;
+  Index created, inserted;
+  Index::ProbeState scratch;
+  for (std::size_t call = 0; call < 6; ++call) {
+    std::vector<unsigned> batch;
+    const std::size_t width = call == 3 ? 5000 : 17 + 300 * call;
+    for (std::size_t i = 0; i < width; ++i)
+      batch.push_back(static_cast<unsigned>((i * 7 + call * 13) % (40 + 60 * call)));
+    const auto handles = rows.append(batch);
+    std::vector<std::uint64_t> created_results(width), created_positions(width);
+    std::vector<std::uint64_t> inserted_results(width), inserted_positions(width);
+    created.find_or_create_many(
+        scratch, width, rows.hash_at(batch), rows.stored_hash(), rows.compare(batch),
+        [&](const std::uint32_t *new_rows, std::size_t count, std::uint64_t *out) {
+          for (std::size_t i = 0; i < count; ++i) out[i] = handles[new_rows[i]];
+        },
+        created_results.data(), created_positions.data());
+    inserted.find_or_insert_many(scratch, width, rows.hash_at(batch), rows.stored_hash(),
+                                 rows.compare(batch), handles.data(), inserted_results.data(),
+                                 inserted_positions.data());
+    CHECK(inserted_results == created_results);
+    CHECK(inserted_positions == created_positions);
+    CHECK_EQ(inserted.size(), created.size());
+    CHECK_EQ(inserted.capacity(), created.capacity());
+    for (std::size_t slot = 0; slot < inserted.capacity(); ++slot)
+      CHECK_EQ(inserted.handle_at(slot), created.handle_at(slot));
+    for (std::size_t row = 0; row < width; ++row) {
+      CHECK_EQ(rows.keys[inserted_results[row] - 1], batch[row]);
+      CHECK_EQ(inserted.handle_at(inserted_positions[row]), inserted_results[row]);
+    }
+    inserted.check_invariants(rows.stored_hash());
+  }
+  CHECK(inserted.size() >= 300u);
+}
+
+// A reserved handle anywhere in the input throws before the index changes or
+// any hash is read.
+TEST(find_or_insert_validates_every_handle_first) {
+  PrebuiltRows rows;
+  Index index;
+  Index::ProbeState scratch;
+  std::vector<unsigned> batch{1, 2, 3};
+  auto handles = rows.append(batch);
+  std::uint64_t results[4], positions[4];
+  index.find_or_insert_many(scratch, 3, rows.hash_at(batch), rows.stored_hash(), rows.compare(batch),
+                            handles.data(), results, positions);
+  const auto capacity = index.capacity();
+  std::vector<unsigned> more{4, 5, 6, 7};
+  auto more_handles = rows.append(more);
+  for (auto reserved : {std::uint64_t{0}, (std::uint64_t{1} << 48) - 1, std::uint64_t{1} << 48}) {
+    more_handles[3] = reserved;
+    std::size_t hashes_read = 0;
+    bool threw = false;
+    try {
+      index.find_or_insert_many(
+          scratch, 4,
+          [&](std::uint32_t row) {
+            ++hashes_read;
+            return PrebuiltRows::hash_of_key(more[row]);
+          },
+          rows.stored_hash(), rows.compare(more), more_handles.data(), results, positions);
+    } catch (const std::invalid_argument &) {
+      threw = true;
+    }
+    CHECK(threw);
+    CHECK_EQ(hashes_read, 0u);
+    CHECK_EQ(index.size(), 3u);
+    CHECK_EQ(index.capacity(), capacity);
+    index.check_invariants(rows.stored_hash());
+  }
+  index.find_or_insert_many(scratch, 0, rows.hash_at(more), rows.stored_hash(), rows.compare(more),
+                            nullptr, nullptr, nullptr);
+  CHECK_EQ(index.size(), 3u);
+}
+
+// A compare failure leaves the rows inserted before it indexed, whole; the
+// build then goes on.
+TEST(find_or_insert_compare_failure_keeps_inserted_rows) {
+  shoal::unsync::HashIndex<void *> index;
+  decltype(index)::ProbeState scratch;
+  int objects[3] = {};
+  void *handles[3] = {&objects[0], &objects[1], &objects[2]};
+  void *results[3];
+  const auto hash = [](std::uint32_t) { return std::uint64_t{0}; };
+  const auto stored_hash = [](void *) { return std::uint64_t{0}; };
+  bool threw = false;
+  try {
+    index.find_or_insert_many(
+        scratch, 3, hash, stored_hash,
+        [](std::uint32_t *, std::size_t, void **, std::uint32_t *) -> std::size_t {
+          throw std::runtime_error("compare");
+        },
+        handles, results);
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK_EQ(index.size(), 1u);
+  index.check_invariants(stored_hash);
+  index.find_or_insert_many(
+      scratch, 3, hash, stored_hash,
+      [&](std::uint32_t *rows, std::size_t n, void **out, std::uint32_t *rejected) {
+        std::size_t k = 0;
+        for (std::size_t i = 0; i < n; ++i)
+          if (out[rows[i]] != handles[rows[i]]) rejected[k++] = rows[i];
+        return k;
+      },
+      handles, results);
+  CHECK_EQ(index.size(), 3u);
+  for (unsigned i = 0; i < 3; ++i) CHECK(results[i] == handles[i]);
+  index.check_invariants(stored_hash);
+}
+
+namespace {
 // A join build's rows, after DuckDB's `JoinHashTable`: every row is kept, the
 // index holds each key's latest row, and a row's `next` is the handle of the
 // row of its key before it (0 at the chain's end). Handles are row number + 1.
@@ -617,20 +770,30 @@ struct JoinRows {
       return n;
     };
   }
+  // How a build indexes its rows: creating each new key's row in `create`,
+  // or, its rows built first, giving every row's handle.
+  enum class Build { created, prebuilt };
   // Materializes the keys' rows, then indexes them in one batch: a new key's
   // row becomes its entry, and a duplicate's is linked to the head and
   // replaces it, in input order.
-  void insert(const std::vector<unsigned> &keys) {
+  void insert(const std::vector<unsigned> &keys, Build build = Build::created) {
     const std::uint64_t first = rows.size() + 1;
     for (auto key : keys) rows.push_back({key, 0});
     std::vector<std::uint64_t> results(keys.size()), positions(keys.size());
-    index.find_or_create_many(
-        scratch, keys.size(), [&](std::uint32_t row) { return hash_of_key(keys[row]); }, stored_hash(),
-        compare(keys),
-        [&](const std::uint32_t *created, std::size_t count, std::uint64_t *handles) {
-          for (std::size_t i = 0; i < count; ++i) handles[i] = first + created[i];
-        },
-        results.data(), positions.data());
+    const auto hash_at = [&](std::uint32_t row) { return hash_of_key(keys[row]); };
+    if (build == Build::created) {
+      index.find_or_create_many(
+          scratch, keys.size(), hash_at, stored_hash(), compare(keys),
+          [&](const std::uint32_t *created, std::size_t count, std::uint64_t *handles) {
+            for (std::size_t i = 0; i < count; ++i) handles[i] = first + created[i];
+          },
+          results.data(), positions.data());
+    } else {
+      std::vector<std::uint64_t> handles(keys.size());
+      for (std::size_t row = 0; row < keys.size(); ++row) handles[row] = first + row;
+      index.find_or_insert_many(scratch, keys.size(), hash_at, stored_hash(), compare(keys),
+                                handles.data(), results.data(), positions.data());
+    }
     for (std::size_t row = 0; row < keys.size(); ++row) {
       const auto handle = first + row;
       if (results[row] == handle) continue;
@@ -783,6 +946,34 @@ TEST(replace_at_rejects_empty_positions_and_reserved_handles) {
   CHECK_EQ(join.index.handle_at(empty), 0u);
   CHECK_EQ(join.index.handle_at(positions[0]), heads[0]);
   join.check_chains();
+}
+
+// The join build both D33 and D34 serve: rows built first, inserted with
+// their handles, duplicates (across batches and within one) linked newest
+// first through replace_at. Reserved to its row count, as a build whose
+// rows' hash slots become chain pointers is, it never reads stored_hash;
+// grown instead, its chains survive the rebuilds.
+TEST(prebuilt_join_build_chains_duplicates_newest_first) {
+  for (const bool reserved : {true, false}) {
+    JoinRows join;
+    std::vector<std::vector<unsigned>> batches{{7, 1, 7, 2, 7, 7}, {}, {2, 7, 99, 1}};
+    for (unsigned i = 0; i < 3000; ++i) batches[1].push_back(i % 3 ? 7 : i % 11);
+    std::size_t total = 0;
+    for (const auto &batch : batches) total += batch.size();
+    if (reserved) join.index.reserve(total, join.stored_hash());
+    const auto capacity = join.index.capacity();
+    for (const auto &batch : batches) join.insert(batch, JoinRows::Build::prebuilt);
+    if (reserved) {
+      CHECK_EQ(join.stored_hash_calls, 0u);
+      CHECK_EQ(join.index.capacity(), capacity);
+    } else {
+      CHECK(join.stored_hash_calls > 0u);
+    }
+    join.check_chains();
+    const auto [heads, positions] = join.heads({7, 99});
+    CHECK_EQ(heads[0], total - 2);
+    CHECK_EQ(heads[1], total - 1);
+  }
 }
 
 TEST_MAIN()

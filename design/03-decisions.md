@@ -446,7 +446,7 @@ Boost's maps skip their mix for it.
 **D33. `HashIndex` repoints an entry; chains of duplicates stay the
 caller's.** (2026-10-26)
 `HashIndex::replace_at(position, handle)` writes another handle into the
-entry at a position that `find_many` or `find_or_create_many` returned,
+entry at a position that `find_many` or an insertion returned,
 and returns the handle it held. The entry's key and hash stay, so its
 fingerprint, tag, slot, size and capacity do: one descriptor write, no
 allocation, and positions stay valid. The new handle must be a row of an
@@ -472,6 +472,28 @@ entry on every duplicate.
   A stale position (one from before growth) that lands on another entry
   is not caught. Unpublished claims never outlive a call, and `HashIndex`
   erases nothing, so a position holds an entry or nothing.
+
+**D34. Rows built before they are indexed bring their handles.**
+(2026-10-26)
+`HashIndex::find_or_insert_many` is `find_or_create_many` with a handle
+for every input row instead of `create`: a row of a new key inserts its
+own handle, a row of an indexed key takes the entry's. Each new key's
+descriptor and tag are written once, final, in the descriptors step
+(`HashProbeIndex::publish_empty`), where `find_or_create_many` claims
+the slot there and commits the handle `create` returns in a pass of its
+own. Both run on one batch driver and one descriptors walk
+(`insert_batches`, `walk_descriptors`), differing only in what a row
+does at an empty slot.
+
+- **Why:** a join build materializes its rows before it indexes them
+  (DuckDB's `JoinHashTable`), so `create` has nothing to create. With
+  handles given, the commit pass, the claims' rollback and a validation a
+  round all go: every handle is validated before anything changes, and a
+  compare failure leaves only whole entries. New keys took 0.8 ns a row
+  less in cache and 1.6 at 2M, as fast as DuckDB's pointer table (doc 05).
+- **Why `find_or_create_many` stays:** an aggregate build materializes a
+  row only for a key it misses, and needs to know which, before it
+  writes one.
 
 ## Measuring
 

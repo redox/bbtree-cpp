@@ -300,12 +300,16 @@ prefetches (AGENTS.md).
 ([`unsync/hash_index.hpp`](../src/shoal/unsync/hash_index.hpp)) indexes rows
 owned elsewhere: it takes cached hashes unchanged, stores row handles
 directly, and does key matching and row creation in bulk, through
-callbacks. It shares the owned map's descriptor storage.
+callbacks. It shares the owned map's descriptor storage. A build inserts
+through `find_or_create_many`, which creates the rows of the keys it
+misses, or, for rows that exist before they are indexed,
+`find_or_insert_many`, which takes their handles (D34).
 
 | Operation | What it does |
 |---|---|
 | `find_many(state, n, hash_at, compare, results, positions)` | each row's handle and position, or a null handle and `UINT64_MAX` |
 | `find_or_create_many(..., stored_hash, compare, create, results, positions)` | the same, creating the rows it misses through `create` |
+| `find_or_insert_many(..., stored_hash, compare, handles, results, positions)` | the same, inserting each new key's row by its given handle (D34) |
 | `handle_at(position)` | the handle at a position, or a null one |
 | `replace_at(position, handle)` | repoints an entry at a row of an equivalent key, and returns the handle it held (D33) |
 | `reserve`, `reserve_from` | grows, rehashing by `stored_hash` or by an enumeration of the rows |
@@ -316,11 +320,12 @@ A position stays valid until `reserve`, growth, `clear` or
 back into the index, `replace_at` included: it is called between batch
 calls. A join build, which keeps every duplicate key, indexes each key's
 latest row and chains the rows of a key through their own next pointers:
-for each row `find_or_create_many` did not create, it links the row to
-what `replace_at(position, row)` returns, in input order, and probing
-then returns the latest row, from which the caller walks the rest.
+it inserts its rows, built already, with `find_or_insert_many`, and for
+each row whose result is another row's handle, links the row to what
+`replace_at(position, row)` returns, in input order. Probing then returns
+the latest row, from which the caller walks the rest, newest first.
 
-`stored_hash` is called only to grow: `find_or_create_many` reserves
+`stored_hash` is called only to grow: an insertion reserves
 `size() + count`, which needs no growth after `reserve(n)` while it stays
 at most `n`. A caller whose rows give up their hashes once indexed, as a
 join build's do to the chain pointer, reserves its final row count first
@@ -451,12 +456,25 @@ wrote, 128 KB of lines, the whole L1, so each is in L2 again by then.
 So most of the measured 6.7 ns is outside the index: the index is 1.6 ns
 a row behind the pointer table at 2M, and half of that is the commit
 pass. A build whose rows exist before it indexes them, as a join's do,
-knows each row's handle before the call. A variant taking those handles
-could write each new key's final descriptor in the descriptors step,
-with no claim, no commit pass, no rollback, and one validation of the
-handles up front. That would remove the commit pass, about 1 ns a row.
-It is not done: the aggregate build creates its rows only for the keys
-it misses, and needs `create`.
+knows each row's handle before the call: `find_or_insert_many` takes
+them (D34), and writes each new key's final descriptor and tag in the
+descriptors step, with no claim, no commit pass and no rollback, the
+handles validated once up front. In one run of each binary, back to back
+(`index_insert_known` against `index_insert_new`, which the change leaves
+at 4.5–4.7 ns in cache in both):
+
+| entries | `find_or_create_many` | `find_or_insert_many` | pointer table insert |
+|---:|---:|---:|---:|
+| 65,536 | 4.6 ns | 3.8 ns | 2.5 ns |
+| 2M | 8.7 ns | 7.1 ns | 7.0 ns |
+| 10M | 14.6 ns | 12.8 ns | 16.0 ns |
+
+The saving, 0.8 ns a row in cache, is about the commit pass the profile
+found. Out of cache it is twice that, 1.6 to 1.8 ns, which the commit
+pass's ten instructions don't explain; it is not explained yet. At 2M the
+index now inserts new keys as fast as the pointer table. The aggregate
+build creates its rows only for the keys it misses, and keeps
+`find_or_create_many`.
 
 ## Verification
 
@@ -472,6 +490,8 @@ readers against writers that grow, erase and clear, and against writers
 that rewrite eight-word values (without its version check a reader sees
 words from two writes, and the test fails); and that what shards retain
 goes back to the allocator. `hash_index_test` covers `HashIndex`, and
-`replace_at` by a join build's chains of duplicates, checked from each
-key's head against every row of the key, through growth. All run
+`find_or_insert_many` against `find_or_create_many` on the same builds,
+result for result and slot for slot; `replace_at` by a join build's
+chains of duplicates, checked from each key's head against every row of
+the key, through growth. All run
 in CTest and the sanitizer builds.
