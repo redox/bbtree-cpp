@@ -600,8 +600,12 @@ struct JoinRows {
   static std::uint64_t hash_of_key(unsigned key) {
     return (std::uint64_t{key % 5 + 1} << 48) | (key % 4);
   }
-  auto stored_hash() const {
-    return [this](std::uint64_t handle) { return hash_of_key(rows[handle - 1].key); };
+  std::size_t stored_hash_calls = 0;
+  auto stored_hash() {
+    return [this](std::uint64_t handle) {
+      ++stored_hash_calls;
+      return hash_of_key(rows[handle - 1].key);
+    };
   }
   // Compares keys[row] with the key of the row its result names.
   auto compare(const std::vector<unsigned> &keys) const {
@@ -727,6 +731,25 @@ TEST(replace_at_after_growth) {
   CHECK(join.index.capacity() > grown);
   join.check_chains();
   join.insert({5, 3, 6});
+  join.check_chains();
+}
+
+// A join build whose rows' hash slots become chain pointers reserves its
+// final row count, then inserts without ever reaching stored_hash.
+TEST(reserved_build_never_calls_stored_hash) {
+  JoinRows join;
+  const std::size_t total = 5000;
+  join.index.reserve(total, join.stored_hash());
+  const auto capacity = join.index.capacity();
+  std::vector<unsigned> batch;
+  for (std::size_t inserted = 0; inserted < total; inserted += batch.size()) {
+    batch.clear();
+    for (std::size_t i = inserted; i < std::min(total, inserted + 1700); ++i)
+      batch.push_back(static_cast<unsigned>(i % 3 ? i : i % 50));
+    join.insert(batch);
+  }
+  CHECK_EQ(join.stored_hash_calls, 0u);
+  CHECK_EQ(join.index.capacity(), capacity);
   join.check_chains();
 }
 

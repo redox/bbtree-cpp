@@ -161,7 +161,10 @@ class HashIndex {
   }
 
   // stored_hash(Handle) returns the cached uint64_t hash for reserve/rebuild or
-  // invariant checking. create(const row_type *new_rows, size_t count,
+  // invariant checking. It is called only to grow, when size() + count exceeds
+  // what the capacity holds: after reserve(n), a call with size() + count <= n
+  // never calls it, so a caller whose rows no longer hold their hashes may
+  // reserve its final row count first. create(const row_type *new_rows, size_t count,
   // Handle *new_handles) materializes one batch and returns handles in row order.
   // Each returned handle must identify its requested key, with stored_hash(handle)
   // equal to hash_at(new_row). All output handles must be initialized in row order.

@@ -320,6 +320,12 @@ for each row `find_or_create_many` did not create, it links the row to
 what `replace_at(position, row)` returns, in input order, and probing
 then returns the latest row, from which the caller walks the rest.
 
+`stored_hash` is called only to grow: `find_or_create_many` reserves
+`size() + count`, which needs no growth after `reserve(n)` while it stays
+at most `n`. A caller whose rows give up their hashes once indexed, as a
+join build's do to the chain pointer, reserves its final row count first
+and never needs them.
+
 It probes as the owned map does (D27): tags first, eight at a time as
 one word, reading a descriptor only where a tag matches, so a key that
 is absent reads none. A new entry writes its tag once: its claim writes
