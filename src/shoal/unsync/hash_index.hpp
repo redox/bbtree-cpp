@@ -80,9 +80,10 @@ class HashIndex {
   // std::out_of_range, a reserved handle std::invalid_argument. One descriptor
   // write; no allocation, and positions stay valid. Not from callbacks.
   Handle replace_at(position_type position, Handle new_handle) {
-    if (position >= capacity() || !index_.occupied(static_cast<std::size_t>(position)))
-      throw std::out_of_range("HashIndex position holds no entry");
-    validate_handle(new_handle);
+    // The throws out of line, so that a call a duplicate row inlines (D33).
+    if (SHOAL_UNLIKELY(position >= capacity() || !index_.occupied(static_cast<std::size_t>(position))))
+      throw_no_entry();
+    if (SHOAL_UNLIKELY(!valid_handle(new_handle))) throw_reserved_handle();
     const auto slot = static_cast<std::size_t>(position);
     const auto previous = decode(index_.identifier(slot));
     index_.replace_identifier(slot, encode(new_handle));
@@ -295,10 +296,18 @@ class HashIndex {
       invalid |= encode(handles[i]) - 1 >= (std::uint64_t{1} << 48) - 2;
     if (invalid) throw std::invalid_argument("HashIndex handle must be in [1, 2^48-2]");
   }
-  static void validate_handle(Handle handle) {
+  static bool valid_handle(Handle handle) noexcept {
     const auto encoded = encode(handle);
-    if (!encoded || encoded >= (std::uint64_t{1} << 48) - 1)
-      throw std::invalid_argument("HashIndex handle must be in [1, 2^48-2]");
+    return encoded && encoded < (std::uint64_t{1} << 48) - 1;
+  }
+  static void validate_handle(Handle handle) {
+    if (!valid_handle(handle)) throw_reserved_handle();
+  }
+  [[noreturn]] SHOAL_COLD static void throw_reserved_handle() {
+    throw std::invalid_argument("HashIndex handle must be in [1, 2^48-2]");
+  }
+  [[noreturn]] SHOAL_COLD static void throw_no_entry() {
+    throw std::out_of_range("HashIndex position holds no entry");
   }
   static void validate_count(std::size_t count) {
     if (count > std::numeric_limits<row_type>::max())

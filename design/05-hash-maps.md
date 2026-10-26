@@ -496,6 +496,63 @@ against 4.9–5.1 before, and held out of cache (16.5 → 15.7 at 2M, 23.6 →
 mostly a few keys' duplicates, and predicts it; the aggregate's mixed
 build goes through `find_or_create_many`, which does not branch on it.
 
+### In DuckDB's join
+
+The join integration replaces `JoinHashTable`'s pointer table: the build
+inserts row pointers with `find_or_insert_many`, prepends duplicates with
+`replace_at`, and probes with `find_many`. Against stock DuckDB
+(`1641475ef1d`), one run a process, the builds alternating, medians of
+three to five runs in ms, on an M4 Pro at a load of 4.3 to 4.9:
+
+| cell | threads | stock | shoal |
+|---|---:|---:|---:|
+| build: 8M distinct keys, 8M probe rows | 1 | 279 | 278 |
+| build | 8 | 47–54 | 43–47 |
+| probe: 2M keys, 20M probe rows | 1 | 359 | 307 |
+| probe | 8 | 58–60 | 54–59 |
+| duplicates: 1M build rows on 50K keys, 2M probe rows | 1 | 100–109 | 104–108 |
+| duplicates | 8 | 22.9 | 18.7 |
+| small: 200K keys, 2M probe rows | 8 | 4.9 | 5.0 |
+
+What each decision bought, in the cells that showed it:
+
+- *An index per radix partition* (D36): one index, its inserts serialized
+  by a lock because finalize tasks run in parallel, took the 8-thread
+  build to 172 ms against stock's 58; partitioned, 46–53, and with each
+  task reserving its own index, so that indexes are zeroed in parallel
+  as stock's table is, 44. Routing probes to 16 indexes cost nothing
+  measurable.
+- *Compacting a mostly empty index* (D37): reserved for its build rows,
+  the duplicates cell's index held its keys over 18 MB, and a probe
+  missed for both its tag and its descriptor; at one thread the cell was
+  12% behind stock, after, at parity.
+- *Parallel from 128K rows* (D38): the duplicates cell builds on its 1M
+  rows, under stock's 1M-row threshold, so its build was one thread's on
+  the critical path of an 8-thread query, 12 ms of inserts against
+  stock's 7, CPU time otherwise equal: 28.5 ms against stock's 22.9,
+  parallel 18.7. Of those 5 ms, sizing the index for its keys rather
+  than its rows took 2.4 (an index reserved for 64K rows); the rest is
+  spread over the descriptors walk, the key gathers in `compare` and the
+  chaining, none above a sixth of it.
+
+`replace_at`, called once a duplicate, inlines since its throws are cold
+functions: 29.8 to 28.9 ms in the duplicates cell, inside the noise.
+
+Two directions for the one-thread build, then up to 5% behind stock, were
+measured and dropped, in the isolated bench and a scratch table:
+
+- *A key's tag and descriptor in one line*, groups of 64 bytes of eight
+  tag bytes and seven descriptors: a row at a time, at the same load,
+  inserts took 10.7 ns a row at 8M against the split layout's 8.1 and the
+  pointer table's 7.5–8.0, and hits 26.4 against 18.9 and 17.9. The split
+  layout a row at a time already matches the pointer table; the gap is
+  not the layout.
+- *The first round's tags step folded into the loop that takes each
+  row's hash*, with no setup pass before it: `insert_known` at 8M took
+  24–26 ns a row against 10–11, the rows no longer overlapping. Storing
+  the tag through a type that aliases nothing took it to 21–22; most of
+  the loss is not explained.
+
 ## Verification
 
 `hash_map_test` checks mixed operations against `std::unordered_map`,
@@ -513,5 +570,4 @@ goes back to the allocator. `hash_index_test` covers `HashIndex`, and
 `find_or_insert_many` against `find_or_create_many` on the same builds,
 result for result and entry for entry; `replace_at` by a join build's
 chains of duplicates, checked from each key's head against every row of
-the key, through growth. All run
-in CTest and the sanitizer builds.
+the key, through growth. All run in CTest and the sanitizer builds.

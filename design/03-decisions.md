@@ -465,6 +465,8 @@ entry on every duplicate.
   one batch, a duplicate's result names the key's first row of the batch,
   not the head after the rows before it replaced it; the handle
   `replace_at` returns is the head as it is, the row to link to.
+- **Why it throws out of line:** a join build calls it once a duplicate
+  row; with its throws in cold functions the call inlines.
 - **Why it throws:** a position past capacity, or one with no entry,
   throws `std::out_of_range`, and a reserved handle `std::invalid_argument`
   as `find_or_create_many`'s do, before anything is written. Checking the
@@ -482,9 +484,9 @@ descriptor and tag are written once, final, in the tags step where its
 tags stop at an empty slot (D35), or in the descriptors step past
 another key's (`HashProbeIndex::publish_empty`), where
 `find_or_create_many` claims the slot and commits the handle `create`
-returns in a pass of its own. Both run on one batch driver and one descriptors walk
-(`insert_batches`, `walk_descriptors`), differing only in what a row
-does at an empty slot.
+returns in a pass of its own. Both run on one batch driver and one
+descriptors walk (`insert_batches`, `walk_descriptors`), differing only
+in what a row does at an empty slot.
 
 - **Why:** a join build materializes its rows before it indexes them
   (DuckDB's `JoinHashTable`), so `create` has nothing to create. With
@@ -525,6 +527,67 @@ new.
   depend on how the core predicted those loads (11 to 13.6 ns a row at
   8M between two builds of one call); the loop keeps them in locals and
   adds to `size_` once.
+
+**D36. A parallel join build gets an index per radix partition.**
+(2026-10-26)
+`HashIndex` is unsync, and stays so. DuckDB's join builds its table from
+finalize tasks running in parallel, one radix partition's rows a task
+(the build side is partitioned by the hash's bits 44 to 47 at sink). So
+the DuckDB integration builds one `HashIndex` per radix partition, each
+reserved to its partition's rows by the one task that builds the
+partition, on its first insert, and written by it alone; probes route a
+row to its partition's index by the same bits. A single-threaded finalize
+keeps one index, reserved before it.
+
+- **Why:** a single index, written under one lock, serialized the build:
+  8M distinct keys at 8 threads took 172 ms against stock DuckDB's 58.
+  Partitioned, 46 to 53 ms; probing 16 indexes a chunk, in runs of a
+  partition's rows, cost the probe nothing measurable (58 against stock's
+  62 ms at 8 threads, 20M probe rows into 2M keys).
+- **Why each task reserves its index:** reserving zeroes the index's
+  block, and all 16 reserved before finalize zeroed them on one thread,
+  where stock DuckDB zeroes its table in parallel tasks: 8M keys at 8
+  threads took 48.6 ms reserved up front, 44.3 reserved in their tasks,
+  against stock's 49.7.
+- **Why the partition bits fit:** they sit just below the 16-bit
+  fingerprint and far above any home slot's bits, so a partition's keys
+  still spread over its slots and still differ in fingerprint.
+- **Why a lock an index anyway:** a partition can still be split between
+  tasks (more threads than partitions); the lock is uncontended
+  otherwise.
+
+**D37. A join index whose keys repeat is rebuilt for its entries.**
+(2026-10-26)
+A join build reserves its index for every build row, so that no insert
+grows it (its rows' hashes are overwritten by chain pointers). Where
+keys repeat, the index holds one entry a key and is mostly empty: once
+its build is done and before any probe, the DuckDB integration rebuilds
+an index at load 1/8 or less into one reserved for its entries, from its
+heads, rehashing their keys in vectors of 2048: in the finalize task
+that built it, where one task built it, and otherwise once finalize is
+done. Its chains, in the rows, do not change.
+
+- **Why:** a probe of a sparse index out of cache misses for its tag and
+  for its descriptor, where DuckDB's pointer table, as sparse, misses
+  once. 1M build rows on 50K keys (20 a key), 2M probe rows: 118 ms
+  against stock's 106 before, 108 after, at one thread.
+- **Why not reserve less:** DuckDB keeps no estimate of distinct build
+  keys, and growth would rehash from keys row by row; a distinct-key
+  build (load near 1/2) never pays the check's scan.
+
+**D38. A shoal join build goes parallel from 128K rows.** (2026-10-26)
+The DuckDB integration finalizes a join build in parallel from 131,072
+rows (2^17), where stock DuckDB does from 1M: a parallel build there is
+D36's, an index a partition and a task, sharing nothing.
+
+- **Why:** stock's threshold suits its parallel build, atomic inserts
+  into one table. Below it, a build was one thread's in both, and on the
+  critical path of a parallel query: 1M build rows on 50K keys, 2M probe
+  rows, the duplicates cell, took 28.5 ms against stock's 22.9 at 8
+  threads, its 12 ms of inserts on one thread. In parallel, 18.7 ms.
+- **Why not lower:** a 200K-row build probed 2M times took 5.0 ms against
+  4.8 single-threaded and stock's 4.9, at 8 threads; it gains nothing
+  there, and smaller builds have less to share out.
 
 ## Measuring
 
