@@ -300,12 +300,16 @@ prefetches (AGENTS.md).
 ([`unsync/hash_index.hpp`](../src/shoal/unsync/hash_index.hpp)) indexes rows
 owned elsewhere: it takes cached hashes unchanged, stores row handles
 directly, and does key matching and row creation in bulk, through
-callbacks. It shares the owned map's descriptor storage.
+callbacks. It shares the owned map's descriptor storage. A build inserts
+through `find_or_create_many`, which creates the rows of the keys it
+misses, or, for rows that exist before they are indexed,
+`find_or_insert_many`, which takes their handles (D34).
 
 | Operation | What it does |
 |---|---|
 | `find_many(state, n, hash_at, compare, results, positions)` | each row's handle and position, or a null handle and `UINT64_MAX` |
 | `find_or_create_many(..., stored_hash, compare, create, results, positions)` | the same, creating the rows it misses through `create` |
+| `find_or_insert_many(..., stored_hash, compare, handles, results, positions)` | the same, inserting each new key's row by its given handle (D34) |
 | `handle_at(position)` | the handle at a position, or a null one |
 | `replace_at(position, handle)` | repoints an entry at a row of an equivalent key, and returns the handle it held (D33) |
 | `reserve`, `reserve_from` | grows, rehashing by `stored_hash` or by an enumeration of the rows |
@@ -316,11 +320,12 @@ A position stays valid until `reserve`, growth, `clear` or
 back into the index, `replace_at` included: it is called between batch
 calls. A join build, which keeps every duplicate key, indexes each key's
 latest row and chains the rows of a key through their own next pointers:
-for each row `find_or_create_many` did not create, it links the row to
-what `replace_at(position, row)` returns, in input order, and probing
-then returns the latest row, from which the caller walks the rest.
+it inserts its rows, built already, with `find_or_insert_many`, and for
+each row whose result is another row's handle, links the row to what
+`replace_at(position, row)` returns, in input order. Probing then returns
+the latest row, from which the caller walks the rest, newest first.
 
-`stored_hash` is called only to grow: `find_or_create_many` reserves
+`stored_hash` is called only to grow: an insertion reserves
 `size() + count`, which needs no growth after `reserve(n)` while it stays
 at most `n`. A caller whose rows give up their hashes once indexed, as a
 join build's do to the chain pointer, reserves its final row count first
@@ -407,56 +412,146 @@ and 5M groups 125–160 against 113–130 and 191–206.
 
 ### Building on new keys
 
-A join build under DuckDB inserted distinct keys about 6.7 ns a row
-slower than DuckDB's own pointer table, a figure taken as a build cell
-less a probe cell. `bench/hash_index_bench.cpp` times the index's part
-alone: random prehashed keys, 2048 rows a call, into an index reserved to
-its final size, so no row grows it; then hits on the same keys; then the
-same rows into a table of DuckDB's salt and pointer slots at the index's
-capacity, a row at a time, as DuckDB's build loop inserts. One run each,
-10M rows a cell, on an M4 Pro with other work running (`c861082`):
+A join build under DuckDB inserts distinct keys out of cache, into an
+index reserved to its row count. `bench/hash_index_bench.cpp` times that
+alone: random prehashed keys, 2048 rows a call, every row a new key, so
+`compare` is reached only past another key of its fingerprint (7 rows in
+a million at 8M) and `stored_hash` never. Against it, the same rows go
+into a table after DuckDB's join pointer table, a 16-bit salt over a
+48-bit pointer a slot, probed linearly a row at a time, at the index's
+capacity: load at most 0.5, as DuckDB sizes its table. The `rows` cells
+are the same shaped as the join calls the index: handles point at 32-byte
+rows, positions are requested, and the build writes each row's chain
+pointer after each call; the pointer table's writes it too. The `mixed`
+cells draw keys from half as many, about 43% of rows new, in random
+order.
 
-| entries | insert new | find hit | pointer table insert | insert / pointer |
-|---:|---:|---:|---:|---:|
-| 65,536 (in L2) | 4.6 ns | 2.7 ns | 2.4 ns | 1.9 |
-| 2M | 8.0 ns | 7.6 ns | 6.4 ns | 1.25 |
-| 10M | 15.2 ns | 14.2 ns | 15.8 ns | 0.96 |
+An earlier pass of these cells sized the pointer table at 10M rows,
+load 0.625, where its clusters made it slower than the index; at DuckDB's
+load it is not, and the index was 1.56 times its time at 8M and 1.78 at
+16M, about 5 ns a row, the gap the join build measured.
 
-The times out of cache moved by a sixth between passes on the busy
-machine (8.0 and 9.5 ns at 2M), the ratios by less than 0.05. Even
-distinct keys reach `compare` now and then, past another key of their
-fingerprint: 5 rows in a million at 2M.
+**In cache**, a profile (line tables, sampled PCs mapped to their lines
+with their inlining) put about 1 ns of `find_or_create_many`'s 4.6 in its
+commit pass, which revisits the 2048 claimed descriptors once they have
+left L1. `find_or_insert_many` (D34) has no commit pass.
 
-The model this replaced was that a new key costs what a hit costs and a
-second random line: the hit reads its tag and descriptor, the new key
-reads its tag and writes a descriptor no load brought in, where the
-pointer table reads and writes one slot. The cells refute it. Out of
-cache a new key costs what a hit does, and the pointer table, at one line
-a row, is not twice as fast: at 10M it is slower, since the steps keep
-2048 rows' loads in flight where a loop a row at a time keeps what the
-reorder window holds. The gap is CPU work: 2.2 ns a row in cache, 1.6
-at 2M.
+**Out of cache**, at 16M (descriptors 256 MB, tags 32 MB), the profile of
+`find_or_insert_many` put 54% of its samples in the tags step, waiting on
+the tag group's load, 33% in the descriptors step, at the stores of each
+new key's descriptor and tag, and under 15% in everything else: taking
+hashes and setting up scratch, validating handles, results, positions. A
+new key touches two lines, its tag's and its descriptor's, where the
+pointer table touches one, but that is not what costs. A loop a row at a
+time that loads a tag and then stores the slot, the index's access
+pattern, took 8.3 ns a row at 8M against the pointer table's 8.2, and
+adding a store-only tag to the pointer table 10.6: the second line costs
+about 2 ns, and only where nothing hides it. In steps, nothing does. The
+tags step waits for the tags of 2048 rows, then the descriptors step
+issues 2048 stores that miss, with no loads to overlap them with, so a
+row pays both latencies, one after the other.
 
-A profile of the in-cache cells (line tables, PCs mapped to lines with
-their inlining, 4,698 samples of insert, 2,891 of hits) splits them by
-step. The tags step costs the same in both, about 1.3 ns a row. The
-descriptors step costs a new key about 1.6 ns (its tag read again, the
-claim's descriptor, tag and list writes) against a hit's 1.0 for
-`confirm`. The commit pass costs about 1.0 ns, and a hit has nothing like
-it but its 0.2 in `compare`. That pass is ten instructions a claim,
-`size_` in a register, and validation before it is vectorized. It costs
-what it does because it goes back to the 2048 descriptors the claims
-wrote, 128 KB of lines, the whole L1, so each is in L2 again by then.
+So `find_or_insert_many` publishes a new key in its tags step, where its
+tag shows the slot empty (D35): the descriptor's and tag's stores then
+overlap the next rows' tag loads, as a loop a row at a time overlaps
+them, and only rows stopped at a tag of their hash go on to the
+descriptors step. The loop holds the block's pointers and capacity in
+locals and counts `size_` once: written through members, each row's tag
+store, through a byte pointer that may alias them, made the compiler read
+them again, and the loop's speed depended on how the core predicted those
+loads past the stores (13.6 ns a row at 8M in the bench, 11 in a
+standalone build of the same call; both 11 with locals).
 
-So most of the measured 6.7 ns is outside the index: the index is 1.6 ns
-a row behind the pointer table at 2M, and half of that is the commit
-pass. A build whose rows exist before it indexes them, as a join's do,
-knows each row's handle before the call. A variant taking those handles
-could write each new key's final descriptor in the descriptors step,
-with no claim, no commit pass, no rollback, and one validation of the
-handles up front. That would remove the commit pass, about 1 ns a row.
-It is not done: the aggregate build creates its rows only for the keys
-it misses, and needs `create`.
+One run of each binary, back to back (e84ce1b before, this after), ns a
+row, the ratio to the pointer table's cell in the same run:
+
+| entries | `insert_known` | `insert_rows` | pointer `new`, `rows` | `insert_known` / pointer | `insert_rows` / pointer |
+|---:|---:|---:|---:|---:|---:|
+| 65,536 | 4.4 → 2.7 | 4.9 → 3.2 | 2.5–2.7, 2.8–3.1 | 1.8 → 1.0 | 1.6 → 1.1 |
+| 2M | 7.4 → 4.4 | 9.1 → 6.0 | 6.5–6.8, 7.1–7.8 | 1.14 → 0.65 | 1.28 → 0.77 |
+| 8M | 12.5 → 11.3 | 14.5 → 11.8 | 8.0–8.2, 8.7–10.1 | 1.56 → 1.38 | 1.67 → 1.17 |
+| 16M | 14.8 → 12.7 | 17.6 → 14.5 | 8.3, 9.4–9.9 | 1.78 → 1.53 | 1.87 → 1.46 |
+
+Out of cache the machine had other work running, and a cell's time moved
+by up to a fifth between runs; the ratios by about a tenth (8M
+`insert_rows` against its pointer cell read 1.17 here, 1.40 in another
+run). `find_or_create_many`, which keeps its tags step as it was, held:
+4.8–4.9 against 4.9–5.2 ns in cache, and by ratio 1.87 against 1.85 at
+16M.
+
+The gap left out of cache, 1.4 to 1.5 times the pointer table at 8M and
+16M, is the work around each row's miss: the loop issues four stores a
+row (slot, pending row, descriptor, tag) where the pointer table's issues
+one, and reads its tags a group at a time. Two changes the profile
+suggested took nothing: reading the aligned tag group that holds a slot,
+so that no group crosses a line as one does from a line's last seven
+slots, moved no cell; and publishing with no branch, storing a staying
+row's descriptor and tag to a sink, took the in-cache mixed cell nowhere
+and the 2M one from 15.7 to 23.7 ns. Neither is done.
+
+The branch costs where whether a row is new can't be predicted: the
+mixed cell of `find_or_insert_many` took 6.0–6.3 ns a row in cache
+against 4.9–5.1 before, and held out of cache (16.5 → 15.7 at 2M, 23.6 →
+24.0 at 8M, 25.3 → 24.5 at 16M). A join build is mostly new keys, or
+mostly a few keys' duplicates, and predicts it; the aggregate's mixed
+build goes through `find_or_create_many`, which does not branch on it.
+
+### In DuckDB's join
+
+The join integration replaces `JoinHashTable`'s pointer table: the build
+inserts row pointers with `find_or_insert_many`, prepends duplicates with
+`replace_at`, and probes with `find_many`. Against stock DuckDB
+(`1641475ef1d`), one run a process, the builds alternating, medians of
+three to five runs in ms, on an M4 Pro at a load of 4.3 to 4.9:
+
+| cell | threads | stock | shoal |
+|---|---:|---:|---:|
+| build: 8M distinct keys, 8M probe rows | 1 | 279 | 278 |
+| build | 8 | 47–54 | 43–47 |
+| probe: 2M keys, 20M probe rows | 1 | 359 | 307 |
+| probe | 8 | 58–60 | 54–59 |
+| duplicates: 1M build rows on 50K keys, 2M probe rows | 1 | 100–109 | 104–108 |
+| duplicates | 8 | 22.9 | 18.7 |
+| small: 200K keys, 2M probe rows | 8 | 4.9 | 5.0 |
+
+What each decision bought, in the cells that showed it:
+
+- *An index per radix partition* (D36): one index, its inserts serialized
+  by a lock because finalize tasks run in parallel, took the 8-thread
+  build to 172 ms against stock's 58; partitioned, 46–53, and with each
+  task reserving its own index, so that indexes are zeroed in parallel
+  as stock's table is, 44. Routing probes to 16 indexes cost nothing
+  measurable.
+- *Compacting a mostly empty index* (D37): reserved for its build rows,
+  the duplicates cell's index held its keys over 18 MB, and a probe
+  missed for both its tag and its descriptor; at one thread the cell was
+  12% behind stock, after, at parity.
+- *Parallel from 128K rows* (D38): the duplicates cell builds on its 1M
+  rows, under stock's 1M-row threshold, so its build was one thread's on
+  the critical path of an 8-thread query, 12 ms of inserts against
+  stock's 7, CPU time otherwise equal: 28.5 ms against stock's 22.9,
+  parallel 18.7. Of those 5 ms, sizing the index for its keys rather
+  than its rows took 2.4 (an index reserved for 64K rows); the rest is
+  spread over the descriptors walk, the key gathers in `compare` and the
+  chaining, none above a sixth of it.
+
+`replace_at`, called once a duplicate, inlines since its throws are cold
+functions: 29.8 to 28.9 ms in the duplicates cell, inside the noise.
+
+Two directions for the one-thread build, then up to 5% behind stock, were
+measured and dropped, in the isolated bench and a scratch table:
+
+- *A key's tag and descriptor in one line*, groups of 64 bytes of eight
+  tag bytes and seven descriptors: a row at a time, at the same load,
+  inserts took 10.7 ns a row at 8M against the split layout's 8.1 and the
+  pointer table's 7.5–8.0, and hits 26.4 against 18.9 and 17.9. The split
+  layout a row at a time already matches the pointer table; the gap is
+  not the layout.
+- *The first round's tags step folded into the loop that takes each
+  row's hash*, with no setup pass before it: `insert_known` at 8M took
+  24–26 ns a row against 10–11, the rows no longer overlapping. Storing
+  the tag through a type that aliases nothing took it to 21–22; most of
+  the loss is not explained.
 
 ## Verification
 
@@ -472,6 +567,7 @@ readers against writers that grow, erase and clear, and against writers
 that rewrite eight-word values (without its version check a reader sees
 words from two writes, and the test fails); and that what shards retain
 goes back to the allocator. `hash_index_test` covers `HashIndex`, and
-`replace_at` by a join build's chains of duplicates, checked from each
-key's head against every row of the key, through growth. All run
-in CTest and the sanitizer builds.
+`find_or_insert_many` against `find_or_create_many` on the same builds,
+result for result and entry for entry; `replace_at` by a join build's
+chains of duplicates, checked from each key's head against every row of
+the key, through growth. All run in CTest and the sanitizer builds.

@@ -71,17 +71,19 @@ class HashIndex {
                ? decode(index_.identifier(static_cast<std::size_t>(slot)))
                : Handle{};
   }
-  // Repoints the entry at a position from find_many or find_or_create_many at
-  // new_handle, and returns the handle it held (D33). Its key and hash stay:
+  // Repoints the entry at a position from find_many, find_or_create_many or
+  // find_or_insert_many at new_handle, and returns the handle it held (D33).
+  // Its key and hash stay:
   // stored_hash(new_handle) must equal the replaced handle's, as for another
   // row of an equivalent key. Position and handle are validated before the
   // write: a position past capacity or not holding an entry throws
   // std::out_of_range, a reserved handle std::invalid_argument. One descriptor
   // write; no allocation, and positions stay valid. Not from callbacks.
   Handle replace_at(position_type position, Handle new_handle) {
-    if (position >= capacity() || !index_.occupied(static_cast<std::size_t>(position)))
-      throw std::out_of_range("HashIndex position holds no entry");
-    validate_handle(new_handle);
+    // The throws out of line, so that a call a duplicate row inlines (D33).
+    if (SHOAL_UNLIKELY(position >= capacity() || !index_.occupied(static_cast<std::size_t>(position))))
+      throw_no_entry();
+    if (SHOAL_UNLIKELY(!valid_handle(new_handle))) throw_reserved_handle();
     const auto slot = static_cast<std::size_t>(position);
     const auto previous = decode(index_.identifier(slot));
     index_.replace_identifier(slot, encode(new_handle));
@@ -178,69 +180,76 @@ class HashIndex {
                            StoredHash stored_hash, Compare compare, Create create, Handle *results,
                            position_type *positions = nullptr) {
     validate_count(count);
-    if (count > std::numeric_limits<std::size_t>::max() - size())
-      throw std::length_error("HashIndex size exhausted");
-    reserve(size() + count, stored_hash);
-    for (std::size_t base = 0; base < count;) {
-      const auto width = std::min(maximum_batch_size(), count - base);
-      auto *working_positions = positions ? positions + base : state.slots_;
-      initialize(state, working_positions, base, width, hash_at);
-      auto pending = width;
-      while (pending) {
-        probe_tags(state, working_positions, base, pending);
-        PendingClaims claims(index_, state.new_rows_, working_positions, base);
-        std::size_t candidates = 0;
-        for (std::size_t i = 0; i < pending; ++i) {
-          const auto row = state.pending_[i];
-          const auto fingerprint = state.fingerprints_[row - base];
-          const auto hash = std::uint64_t{fingerprint} << 48;
-          auto at = static_cast<std::size_t>(working_positions[row - base]);
-          bool empty = state.empty_[row - base];
-          // The descriptors step loads one thing a row: at an empty slot its
-          // tag again, which a claim of this round by a row before this one
-          // may have filled, and at a match the descriptor alone. Past
-          // another fingerprint, such a claim's included, it probes on rather
-          // than reach `compare`.
-          for (;;) {
-            if (empty && index_.tag(at) == ProbeIndex::empty_tag) {
-              index_.claim_empty(at, hash);
-              claims.add(row);
-              break;
-            }
-            const auto descriptor = index_.descriptor(at);
-            if (descriptor >> 48 == fingerprint) {
-              // Its handle now, while the descriptor is in cache; a claim of
-              // this round has none until its commit.
-              results[row] = ProbeIndex::descriptor_deleted(descriptor)
-                                 ? Handle{}
-                                 : decode(ProbeIndex::descriptor_identifier(descriptor));
-              state.candidates_[candidates++] = row;
-              break;
-            }
-            at = index_.probe(hash, index_.next(at));
-            empty = index_.tag(at) == ProbeIndex::empty_tag;
-          }
-          working_positions[row - base] = at;
-        }
-        const bool claimed = claims.count() != 0;
-        if (claimed) {
-          create(state.new_rows_, claims.count(), state.new_handles_);
-          validate_handles(state.new_handles_, claims.count());
-          for (std::size_t i = 0; i < claims.count(); ++i) {
-            const auto row = state.new_rows_[i];
-            index_.commit_claim(working_positions[row - base], encode(state.new_handles_[i]));
-            results[row] = state.new_handles_[i];
-          }
-          claims.published();
-        }
-        for (std::size_t i = 0; claimed && i < candidates; ++i) {
-          const auto row = state.candidates_[i];
-          if (results[row] == Handle{}) results[row] = decode(index_.identifier(working_positions[row - base]));
-        }
-        pending = reject_candidates(state, working_positions, base, candidates, compare, results);
-      }
-      base += width;
-    }
+    insert_batches(state, count, hash_at, stored_hash, positions,
+                   [&](std::size_t base, position_type *working_positions, std::size_t pending) {
+                     probe_tags(state, working_positions, base, pending);
+                     PendingClaims claims(index_, state.new_rows_, working_positions, base);
+                     const auto candidates = walk_descriptors(
+                         state, working_positions, base, pending, results,
+                         [&](row_type row, std::size_t at, std::uint64_t hash) {
+                           index_.claim_empty(at, hash);
+                           claims.add(row);
+                         });
+                     const bool claimed = claims.count() != 0;
+                     if (claimed) {
+                       create(state.new_rows_, claims.count(), state.new_handles_);
+                       validate_handles(state.new_handles_, claims.count());
+                       for (std::size_t i = 0; i < claims.count(); ++i) {
+                         const auto row = state.new_rows_[i];
+                         index_.commit_claim(working_positions[row - base], encode(state.new_handles_[i]));
+                         results[row] = state.new_handles_[i];
+                       }
+                       claims.published();
+                     }
+                     for (std::size_t i = 0; claimed && i < candidates; ++i) {
+                       const auto row = state.candidates_[i];
+                       if (results[row] == Handle{})
+                         results[row] = decode(index_.identifier(working_positions[row - base]));
+                     }
+                     return reject_candidates(state, working_positions, base, candidates, compare, results);
+                   });
+  }
+
+  // find_or_create_many for rows that exist before the call, as a join
+  // build's do (D34): handles[row] is the handle of input row `row`. When no
+  // entry matches the row's key, its handle becomes the entry and its result;
+  // when one does, its result is that entry's handle. Every handle is
+  // validated before any mutation; a later row of a key that an earlier row
+  // of the call inserted finds it. hash_at, stored_hash, compare,
+  // results and positions are as for find_or_create_many. Compare failures
+  // leave the rows inserted so far indexed, outputs partial; rebuild
+  // failures preserve the prior index. handles must be disjoint from the
+  // outputs and stay unchanged during the call.
+  template <class HashAt, class StoredHash, class Compare>
+  void find_or_insert_many(ProbeState &state, std::size_t count, HashAt hash_at,
+                           StoredHash stored_hash, Compare compare, const Handle *handles,
+                           Handle *results, position_type *positions = nullptr) {
+    validate_count(count);
+    validate_handles(handles, count);
+    // A row's result is its own handle but where a candidate's replaces it.
+    std::copy(handles, handles + count, results);
+    insert_batches(state, count, hash_at, stored_hash, positions,
+                   [&](std::size_t base, position_type *working_positions, std::size_t pending) {
+                     // New keys are published in the tags step (D35); only
+                     // rows stopped at a tag of their hash walk descriptors.
+                     const auto kept = index_.publish_at_empty_stops(
+                         state.pending_, pending,
+                         [&](row_type row) { return std::uint64_t{state.fingerprints_[row - base]} << 48; },
+                         [&](row_type row) -> position_type & { return working_positions[row - base]; },
+                         [handles](row_type row) { return encode(handles[row]); });
+                     for (std::size_t i = 0; i < kept; ++i) state.empty_[state.pending_[i] - base] = false;
+                     const auto candidates = walk_descriptors(
+                         state, working_positions, base, kept, results,
+                         [&](row_type row, std::size_t at, std::uint64_t hash) {
+                           index_.publish_empty(at, hash, encode(handles[row]));
+                         });
+                     const auto rejected =
+                         reject_candidates(state, working_positions, base, candidates, compare, results);
+                     // A rejected row probes on, its own handle its result again.
+                     for (std::size_t i = 0; i < rejected; ++i)
+                       results[state.pending_[i]] = handles[state.pending_[i]];
+                     return rejected;
+                   });
   }
 
   template <class StoredHash>
@@ -287,10 +296,18 @@ class HashIndex {
       invalid |= encode(handles[i]) - 1 >= (std::uint64_t{1} << 48) - 2;
     if (invalid) throw std::invalid_argument("HashIndex handle must be in [1, 2^48-2]");
   }
-  static void validate_handle(Handle handle) {
+  static bool valid_handle(Handle handle) noexcept {
     const auto encoded = encode(handle);
-    if (!encoded || encoded >= (std::uint64_t{1} << 48) - 1)
-      throw std::invalid_argument("HashIndex handle must be in [1, 2^48-2]");
+    return encoded && encoded < (std::uint64_t{1} << 48) - 1;
+  }
+  static void validate_handle(Handle handle) {
+    if (!valid_handle(handle)) throw_reserved_handle();
+  }
+  [[noreturn]] SHOAL_COLD static void throw_reserved_handle() {
+    throw std::invalid_argument("HashIndex handle must be in [1, 2^48-2]");
+  }
+  [[noreturn]] SHOAL_COLD static void throw_no_entry() {
+    throw std::out_of_range("HashIndex position holds no entry");
   }
   static void validate_count(std::size_t count) {
     if (count > std::numeric_limits<row_type>::max())
@@ -369,6 +386,65 @@ class HashIndex {
       positions[i] = capacity() ? index_.home(hash) : 0;
       state.pending_[i] = static_cast<row_type>(base + i);
     }
+  }
+  // The insertions' batches: each tile's rows in rounds of
+  // round(base, positions, pending), which takes the pending rows' tags
+  // steps (D28), walks the descriptors, inserts and compares, and returns
+  // the rows still pending.
+  template <class HashAt, class StoredHash, class Round>
+  void insert_batches(ProbeState &state, std::size_t count, HashAt &hash_at, StoredHash &stored_hash,
+                      position_type *positions, Round round) {
+    if (count > std::numeric_limits<std::size_t>::max() - size())
+      throw std::length_error("HashIndex size exhausted");
+    reserve(size() + count, stored_hash);
+    for (std::size_t base = 0; base < count;) {
+      const auto width = std::min(maximum_batch_size(), count - base);
+      auto *working_positions = positions ? positions + base : state.slots_;
+      initialize(state, working_positions, base, width, hash_at);
+      auto pending = width;
+      while (pending) pending = round(base, working_positions, pending);
+      base += width;
+    }
+  }
+  // The descriptors step of an insertion: each pending row from the slot its
+  // tags stopped at, to an empty slot, where insert(row, slot, hash) fills
+  // it, or to a slot of its fingerprint, a candidate with that slot's
+  // handle. Returns the candidates' count.
+  template <class Insert>
+  std::size_t walk_descriptors(ProbeState &state, position_type *positions, std::size_t base,
+                               std::size_t pending, Handle *results, Insert &&insert) {
+    std::size_t candidates = 0;
+    for (std::size_t i = 0; i < pending; ++i) {
+      const auto row = state.pending_[i];
+      const auto fingerprint = state.fingerprints_[row - base];
+      const auto hash = std::uint64_t{fingerprint} << 48;
+      auto at = static_cast<std::size_t>(positions[row - base]);
+      bool empty = state.empty_[row - base];
+      // The descriptors step loads one thing a row: at an empty slot its
+      // tag again, which a row before this one may have filled this round,
+      // and at a match the descriptor alone. Past another fingerprint, such
+      // a row's included, it probes on rather than reach `compare`.
+      for (;;) {
+        if (empty && index_.tag(at) == ProbeIndex::empty_tag) {
+          insert(row, at, hash);
+          break;
+        }
+        const auto descriptor = index_.descriptor(at);
+        if (descriptor >> 48 == fingerprint) {
+          // Its handle now, while the descriptor is in cache; a claim of
+          // this round has none until its commit.
+          results[row] = ProbeIndex::descriptor_deleted(descriptor)
+                             ? Handle{}
+                             : decode(ProbeIndex::descriptor_identifier(descriptor));
+          state.candidates_[candidates++] = row;
+          break;
+        }
+        at = index_.probe(hash, index_.next(at));
+        empty = index_.tag(at) == ProbeIndex::empty_tag;
+      }
+      positions[row - base] = at;
+    }
+    return candidates;
   }
   template <class Compare>
   std::size_t reject_candidates(ProbeState &state, position_type *positions, std::size_t base,
