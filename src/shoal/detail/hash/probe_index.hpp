@@ -108,6 +108,45 @@ class HashProbeIndex {
       empty_of(rows[i]) = tags()[found] == empty_tag;
     }
   }
+  /// The tags step of an insertion whose rows bring their identifiers
+  /// (D35): as `probe_tags`, but a row whose tags stop at an empty slot is a
+  /// new key, published there at once as `identifier_of(row)`, so that its
+  /// descriptor's store overlaps the next rows' tag loads. The rows stopped
+  /// at a tag of their hash stay, at the front of `rows` in order, their
+  /// count returned, for the descriptors step.
+  template <class Row, class HashOf, class SlotOf, class IdentifierOf>
+  std::size_t publish_at_empty_stops(Row *rows, std::size_t count, const HashOf &hash_of,
+                                     const SlotOf &slot_of, const IdentifierOf &identifier_of) noexcept {
+    // Locals, not members: a tag's store, through a byte pointer, may alias
+    // anything, and members would be read again after each row's.
+    std::uint64_t *const descriptors = descriptors_;
+    std::uint8_t *const tags = this->tags();
+    const std::size_t capacity = capacity_;
+    std::size_t kept = 0, published = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto row = rows[i];
+      const auto hash = hash_of(row);
+      auto &slot = slot_of(row);
+      const auto wanted = wanted_tag(hash);
+      const auto found = scan_tags(
+          tags, capacity, static_cast<std::size_t>(slot),
+          [wanted](std::uint8_t tag) { return tag == empty_tag || tag == wanted; },
+          [wanted](std::uint64_t group) { return TagGroup(group, wanted).first_match_or_empty(); });
+      slot = found;
+      const bool empty = tags[found] == empty_tag;
+      if (empty) {
+        const auto identifier = identifier_of(row);
+        SHOAL_ASSERT(identifier != 0 && identifier < identifier_mask() && descriptors[found] == 0);
+        descriptors[found] = (hash & ~identifier_mask()) | identifier;
+        tags[found] = wanted;
+        ++published;
+      }
+      rows[kept] = row;
+      kept += !empty;
+    }
+    size_ += published;
+    return kept;
+  }
   /// `probe`'s answer from where `probe_tags` stopped: that slot if `empty`,
   /// with no load, or if it holds `hash`'s fingerprint, with its descriptor's
   /// alone; on from it past another, one tag match in a hundred or so,
@@ -300,17 +339,23 @@ class HashProbeIndex {
   /// at a time. Some tag must stop it.
   template <class Stops, class FirstStop>
   std::size_t scan_tags(std::size_t slot, const Stops &stops, const FirstStop &first_stop) const noexcept {
-    SHOAL_ASSERT(capacity_ != 0);
-    const std::uint8_t *tags = this->tags();
+    return scan_tags(tags(), capacity_, slot, stops, first_stop);
+  }
+  /// `scan_tags` over `capacity` tags at `tags`, for a loop that keeps them
+  /// in locals.
+  template <class Stops, class FirstStop>
+  static std::size_t scan_tags(const std::uint8_t *tags, std::size_t capacity, std::size_t slot,
+                               const Stops &stops, const FirstStop &first_stop) noexcept {
+    SHOAL_ASSERT(capacity != 0);
     for (;;) {
-      if (capacity_ - slot >= TagGroup::width) {
+      if (capacity - slot >= TagGroup::width) {
         std::uint64_t group;
         std::memcpy(&group, tags + slot, sizeof(group));
         const auto found = first_stop(group);
         if (found < TagGroup::width) return slot + found;
-        slot = (slot + TagGroup::width) & (capacity_ - 1);
+        slot = (slot + TagGroup::width) & (capacity - 1);
       } else {
-        for (; slot < capacity_; ++slot)
+        for (; slot < capacity; ++slot)
           if (stops(tags[slot])) return slot;
         slot = 0;
       }

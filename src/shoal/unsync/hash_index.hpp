@@ -181,6 +181,7 @@ class HashIndex {
     validate_count(count);
     insert_batches(state, count, hash_at, stored_hash, positions,
                    [&](std::size_t base, position_type *working_positions, std::size_t pending) {
+                     probe_tags(state, working_positions, base, pending);
                      PendingClaims claims(index_, state.new_rows_, working_positions, base);
                      const auto candidates = walk_descriptors(
                          state, working_positions, base, pending, results,
@@ -224,15 +225,29 @@ class HashIndex {
                            Handle *results, position_type *positions = nullptr) {
     validate_count(count);
     validate_handles(handles, count);
+    // A row's result is its own handle but where a candidate's replaces it.
+    std::copy(handles, handles + count, results);
     insert_batches(state, count, hash_at, stored_hash, positions,
                    [&](std::size_t base, position_type *working_positions, std::size_t pending) {
+                     // New keys are published in the tags step (D35); only
+                     // rows stopped at a tag of their hash walk descriptors.
+                     const auto kept = index_.publish_at_empty_stops(
+                         state.pending_, pending,
+                         [&](row_type row) { return std::uint64_t{state.fingerprints_[row - base]} << 48; },
+                         [&](row_type row) -> position_type & { return working_positions[row - base]; },
+                         [handles](row_type row) { return encode(handles[row]); });
+                     for (std::size_t i = 0; i < kept; ++i) state.empty_[state.pending_[i] - base] = false;
                      const auto candidates = walk_descriptors(
-                         state, working_positions, base, pending, results,
+                         state, working_positions, base, kept, results,
                          [&](row_type row, std::size_t at, std::uint64_t hash) {
                            index_.publish_empty(at, hash, encode(handles[row]));
-                           results[row] = handles[row];
                          });
-                     return reject_candidates(state, working_positions, base, candidates, compare, results);
+                     const auto rejected =
+                         reject_candidates(state, working_positions, base, candidates, compare, results);
+                     // A rejected row probes on, its own handle its result again.
+                     for (std::size_t i = 0; i < rejected; ++i)
+                       results[state.pending_[i]] = handles[state.pending_[i]];
+                     return rejected;
                    });
   }
 
@@ -363,9 +378,10 @@ class HashIndex {
       state.pending_[i] = static_cast<row_type>(base + i);
     }
   }
-  // The insertions' batches: each tile's rows in rounds, every pending row's
-  // tags (D28), then round(base, positions, pending), which walks the
-  // descriptors, inserts and compares, and returns the rows still pending.
+  // The insertions' batches: each tile's rows in rounds of
+  // round(base, positions, pending), which takes the pending rows' tags
+  // steps (D28), walks the descriptors, inserts and compares, and returns
+  // the rows still pending.
   template <class HashAt, class StoredHash, class Round>
   void insert_batches(ProbeState &state, std::size_t count, HashAt &hash_at, StoredHash &stored_hash,
                       position_type *positions, Round round) {
@@ -377,10 +393,7 @@ class HashIndex {
       auto *working_positions = positions ? positions + base : state.slots_;
       initialize(state, working_positions, base, width, hash_at);
       auto pending = width;
-      while (pending) {
-        probe_tags(state, working_positions, base, pending);
-        pending = round(base, working_positions, pending);
-      }
+      while (pending) pending = round(base, working_positions, pending);
       base += width;
     }
   }

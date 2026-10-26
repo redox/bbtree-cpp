@@ -619,8 +619,10 @@ struct PrebuiltRows {
 }  // namespace
 
 // The same builds through find_or_create_many, whose create returns each new
-// row's own handle, and find_or_insert_many: the same results, positions and
-// slots, through tiles, rounds of one batch's duplicates, and growth.
+// row's own handle, and find_or_insert_many: the same results and the same
+// entries, through tiles, rounds of one batch's duplicates, and growth. Not
+// the same slots: find_or_insert_many publishes a new key in its tags step,
+// before rows of its round that walk descriptors (D35).
 TEST(find_or_insert_matches_find_or_create) {
   PrebuiltRows rows;
   Index created, inserted;
@@ -643,11 +645,16 @@ TEST(find_or_insert_matches_find_or_create) {
                                  rows.compare(batch), handles.data(), inserted_results.data(),
                                  inserted_positions.data());
     CHECK(inserted_results == created_results);
-    CHECK(inserted_positions == created_positions);
     CHECK_EQ(inserted.size(), created.size());
     CHECK_EQ(inserted.capacity(), created.capacity());
-    for (std::size_t slot = 0; slot < inserted.capacity(); ++slot)
-      CHECK_EQ(inserted.handle_at(slot), created.handle_at(slot));
+    std::vector<std::uint64_t> inserted_entries, created_entries;
+    for (std::size_t slot = 0; slot < inserted.capacity(); ++slot) {
+      if (const auto handle = inserted.handle_at(slot)) inserted_entries.push_back(handle);
+      if (const auto handle = created.handle_at(slot)) created_entries.push_back(handle);
+    }
+    std::sort(inserted_entries.begin(), inserted_entries.end());
+    std::sort(created_entries.begin(), created_entries.end());
+    CHECK(inserted_entries == created_entries);
     for (std::size_t row = 0; row < width; ++row) {
       CHECK_EQ(rows.keys[inserted_results[row] - 1], batch[row]);
       CHECK_EQ(inserted.handle_at(inserted_positions[row]), inserted_results[row]);

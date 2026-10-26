@@ -478,10 +478,11 @@ entry on every duplicate.
 `HashIndex::find_or_insert_many` is `find_or_create_many` with a handle
 for every input row instead of `create`: a row of a new key inserts its
 own handle, a row of an indexed key takes the entry's. Each new key's
-descriptor and tag are written once, final, in the descriptors step
-(`HashProbeIndex::publish_empty`), where `find_or_create_many` claims
-the slot there and commits the handle `create` returns in a pass of its
-own. Both run on one batch driver and one descriptors walk
+descriptor and tag are written once, final, in the tags step where its
+tags stop at an empty slot (D35), or in the descriptors step past
+another key's (`HashProbeIndex::publish_empty`), where
+`find_or_create_many` claims the slot and commits the handle `create`
+returns in a pass of its own. Both run on one batch driver and one descriptors walk
 (`insert_batches`, `walk_descriptors`), differing only in what a row
 does at an empty slot.
 
@@ -489,11 +490,41 @@ does at an empty slot.
   (DuckDB's `JoinHashTable`), so `create` has nothing to create. With
   handles given, the commit pass, the claims' rollback and a validation a
   round all go: every handle is validated before anything changes, and a
-  compare failure leaves only whole entries. New keys took 0.8 ns a row
-  less in cache and 1.6 at 2M, as fast as DuckDB's pointer table (doc 05).
+  compare failure leaves only whole entries. In cache, new keys took 0.8
+  ns a row less, the commit pass the profile found (doc 05).
 - **Why `find_or_create_many` stays:** an aggregate build materializes a
   row only for a key it misses, and needs to know which, before it
   writes one.
+
+**D35. Rows that bring their handles are inserted in the tags step.**
+(2026-10-26)
+`find_or_insert_many` publishes a row whose tags stop at an empty slot
+there and then, its descriptor and tag written in the loop that reads
+the tags (`HashProbeIndex::publish_at_empty_stops`), and only rows
+stopped at a tag of their hash go on to the descriptors step. This
+departs from D28 in one place: the loop branches on whether a row is
+new.
+
+- **Why:** out of cache, in steps, a row paid its tag's load and then its
+  descriptor's store one after the other: the tags step waits for 2048
+  rows' tags, then the descriptors step issues 2048 stores that miss,
+  with nothing to overlap them. Published where its tags are read, a new
+  key's stores overlap the next rows' loads. At 8M and 16M keys, the join
+  build's sizes, the index went from 1.56 and 1.78 times DuckDB's pointer
+  table to 1.38 and 1.53; in cache and at 2M it is now faster than it
+  (doc 05).
+- **Why the branch:** a new key's stores must not reach a staying row's
+  slot, and storing a staying row's to a sink instead gained nothing in
+  cache and cost out of it. The branch mispredicts only where new keys
+  and indexed ones mix unpredictably: there it costs 1.1 ns a row in
+  cache and nothing out of it. A join's build is mostly new keys, or
+  mostly duplicates; `find_or_create_many`, the aggregate's build, keeps
+  its tags step free of the branch.
+- **Why locals:** a tag's store, through a byte pointer, may alias the
+  index's members, and members read after it made the loop's speed
+  depend on how the core predicted those loads (11 to 13.6 ns a row at
+  8M between two builds of one call); the loop keeps them in locals and
+  adds to `size_` once.
 
 ## Measuring
 
