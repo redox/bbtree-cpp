@@ -209,6 +209,24 @@ assert(*map.get(1) == "one");
 for (const auto& [key, value] : map) { /* in key order */ }
 ```
 
+### Single-threaded set
+
+```cpp
+#include <shoal/unsync/set.hpp>
+
+shoal::unsync::TreeSet<std::uint64_t> set;
+assert(set.insert(1));
+assert(!set.insert(1));  // an equal element is already there
+set.insert(2);
+for (const auto& element : set) { /* in order */ }
+
+shoal::unsync::TreeSet<std::uint64_t> other;
+other.insert(2);
+other.insert(3);
+auto both = set & other;  // intersection; also `-`, `|`, `^`
+assert(both.contains(2) && both.size() == 1);
+```
+
 ### Concurrent hash map
 
 ```cpp
@@ -226,6 +244,69 @@ map.get_many_copied(keys, 2, values);  // bulk: {11, none}
 
 Lookups of keys and values that are trivially copyable take no lock; other
 types hold the key's shard shared.
+
+### Single-threaded hash map
+
+```cpp
+#include <shoal/unsync/hash_map.hpp>
+
+shoal::unsync::HashMap<std::uint64_t, std::string> map;
+map.insert(1, "one");
+const std::string* value = map.get(1);
+map.insert(2, "two");
+map.reserve(1000);
+assert(value && *value == "one");  // the pointer outlives both
+```
+
+A pointer from `get` stays valid across later inserts and `reserve`.
+Removing that entry, `clear`, and assignment invalidate it.
+
+### Hash index
+
+```cpp
+#include <shoal/unsync/hash_index.hpp>
+
+struct Row {
+  std::uint64_t key;
+  std::uint64_t hash;
+};
+Row rows[] = {{10, 0xa1}, {20, 0xb2}, {10, 0xa1}};
+std::vector<Row> stored;  // one row per distinct key; its handle is the 1-based index
+
+shoal::unsync::HashIndex<std::uint64_t> index;
+shoal::unsync::HashIndex<std::uint64_t>::ProbeState state;
+std::uint64_t found[3];
+
+index.find_or_create_many(
+    state, 3,
+    [&](std::uint32_t row) { return rows[row].hash; },
+    [&](std::uint64_t handle) { return stored[handle - 1].hash; },
+    [&](std::uint32_t* candidates, std::size_t count, std::uint64_t* results,
+        std::uint32_t* rejected) {
+      std::size_t n = 0;
+      for (std::size_t i = 0; i < count; ++i)
+        if (rows[candidates[i]].key != stored[results[candidates[i]] - 1].key)
+          rejected[n++] = candidates[i];
+      return n;
+    },
+    [&](const std::uint32_t* new_rows, std::size_t count, std::uint64_t* handles) {
+      for (std::size_t i = 0; i < count; ++i) {
+        stored.push_back(rows[new_rows[i]]);
+        handles[i] = stored.size();
+      }
+    },
+    found);
+
+assert(stored.size() == 2 && found[0] == found[2]);
+```
+
+The caller owns the rows. The index stores a 48-bit handle per key and the
+hash it was given, unmixed; 0 and 2^48-1 are reserved. `compare` lists the
+candidates whose keys differ, and `create` builds a row for each key the
+index does not yet hold. Rows that already exist are indexed with
+`find_or_insert_many`, which takes their handles; a later row of the same
+key gets the handle already stored. Lookups are `find_many`, with the same
+hash and compare.
 
 ### Keys and values
 
